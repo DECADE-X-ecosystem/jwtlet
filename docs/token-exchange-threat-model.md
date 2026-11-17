@@ -64,6 +64,9 @@ or the underlying K8s RBAC is misconfigured, the separation collapses.
 8. Scope strings are used consistently across all participant contexts
 9. The K8s RBAC policy that restricts `service_accounts` membership to
    orchestrator SAs is itself correctly administered
+10. Every issuer in `trusted_issuers` authenticates its clients as reliably as
+    TokenReview authenticates service accounts, and its JWKS endpoint serves
+    only its own keys
 
 If any of these fail, the model's security guarantees collapse — independently
 of implementation quality.
@@ -291,6 +294,35 @@ over-provisioned scopes expand it without any visible signal.
 should hold only the scopes its workload actually requires, even within a shared
 context. Use the `audiences` allowlist to further constrain where tokens can be
 used. Audit scope assignments periodically against actual workload requirements.
+
+---
+
+### T10 — A Trusted External Issuer Extends the Identity Perimeter
+
+**Model element:** `trusted_issuers` — external OIDC providers whose tokens are
+accepted as subject tokens.
+
+**Threat:** Each trusted issuer becomes a second root of caller identity next to
+the cluster. Anyone who can obtain a token from that issuer for a mapped client
+(a leaked client secret, a misconfigured realm that lets users mint tokens with
+the jwtlet audience, a compromised IdP admin, or a JWKS endpoint that serves an
+attacker's key) can exchange it under that client's mappings.
+
+**What the model does:**
+- Verification is local and strict: asymmetric algorithms only, `iss` must equal
+  the configured issuer, `aud` must contain `token.client_audience`, `exp` is
+  required. A forged `iss` only selects which verifier rejects the token.
+- Subjects are namespaced by the issuer's `subject_prefix`; prefixes cannot start
+  with `system:` or overlap, so an external issuer can never mint a subject that
+  matches a service account or another issuer's subject.
+- Mappings still gate everything: a valid external token without a mapping for
+  its prefixed subject gets nothing.
+- The management API does not accept external tokens, so the orchestrator tier
+  stays Kubernetes-only.
+
+**Residual risk:** The issuer's own client authentication is outside Jwtlet's
+control. Operators should restrict the jwtlet audience to the clients that need
+it, keep external mappings to the minimum scopes, and use short `token_ttl_secs`.
 
 ---
 

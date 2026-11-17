@@ -1,4 +1,5 @@
 //  Copyright (c) 2026 Metaform Systems, Inc
+//  Copyright (c) 2026 Airbus SAS
 //
 //  This program and the accompanying materials are made available under the
 //  terms of the Apache License, Version 2.0 which is available at
@@ -8,14 +9,16 @@
 //
 //  Contributors:
 //       Metaform Systems, Inc. - initial API and implementation
+//       Airbus SAS - trusted external issuers
 //
 
 #![allow(clippy::unwrap_used)]
 
 use crate::config::{
-    DEFAULT_BIND_ADDRESS, DEFAULT_MANAGEMENT_PORT, DEFAULT_PARTICIPANT_CONTEXT_CLAIM, DEFAULT_SA_TOKEN_FILE,
-    DEFAULT_TOKEN_EXCHANGE_PORT, DEFAULT_TOKEN_TTL_SECS, JwtletConfig, K8sConfig, MAX_TOKEN_TTL_SECS, ManagementConfig,
-    PostgresPoolConfig, StorageBackend, TokenConfig, ValidationError, VaultConfig,
+    DEFAULT_BIND_ADDRESS, DEFAULT_JWKS_CACHE_TTL, DEFAULT_MANAGEMENT_PORT, DEFAULT_PARTICIPANT_CONTEXT_CLAIM,
+    DEFAULT_SA_TOKEN_FILE, DEFAULT_SUBJECT_CLAIM, DEFAULT_TOKEN_EXCHANGE_PORT, DEFAULT_TOKEN_TTL_SECS, JwtletConfig,
+    K8sConfig, MAX_TOKEN_TTL_SECS, ManagementConfig, PostgresPoolConfig, StorageBackend, TokenConfig,
+    TrustedIssuerConfig, ValidationError, VaultConfig,
 };
 use std::time::Duration;
 
@@ -46,6 +49,7 @@ fn valid_config() -> JwtletConfig {
         management: ManagementConfig {
             client_audience: Some("jwtlet-management".to_string()),
         },
+        trusted_issuers: Vec::new(),
     }
 }
 
@@ -435,4 +439,158 @@ fn validate_fails_when_k8s_api_server_url_is_not_https() {
     let mut cfg = valid_config();
     cfg.k8s.api_server_url = Some("http://kubernetes.default.svc".to_string());
     assert_error_contains(&cfg, "k8s.api_server_url must use https");
+}
+
+// ============================================================================
+// Trusted issuers
+// ============================================================================
+
+fn trusted_issuer(issuer: &str, prefix: &str) -> TrustedIssuerConfig {
+    TrustedIssuerConfig {
+        issuer: issuer.to_string(),
+        jwks_url: format!("{issuer}/protocol/openid-connect/certs"),
+        subject_prefix: prefix.to_string(),
+        subject_claim: "sub".to_string(),
+        jwks_cache_ttl: Duration::from_secs(300),
+    }
+}
+
+fn cfg_with_issuers(issuers: Vec<TrustedIssuerConfig>) -> JwtletConfig {
+    let mut cfg = valid_config();
+    cfg.trusted_issuers = issuers;
+    cfg
+}
+
+#[test]
+fn trusted_issuers_parse_from_toml_with_defaults() {
+    let toml = r#"
+        [[trusted_issuers]]
+        issuer = "https://idp.example.com/realms/a"
+        jwks_url = "https://idp.example.com/realms/a/protocol/openid-connect/certs"
+        subject_prefix = "idp-a:"
+
+        [[trusted_issuers]]
+        issuer = "https://idp.example.com/realms/b"
+        jwks_url = "https://idp.example.com/realms/b/protocol/openid-connect/certs"
+        subject_prefix = "idp-b:"
+        subject_claim = "azp"
+        jwks_cache_ttl = "1m"
+    "#;
+
+    let cfg: JwtletConfig = config::Config::builder()
+        .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+        .build()
+        .unwrap()
+        .try_deserialize()
+        .unwrap();
+
+    assert_eq!(cfg.trusted_issuers.len(), 2);
+    assert_eq!(cfg.trusted_issuers[0].subject_claim, DEFAULT_SUBJECT_CLAIM);
+    assert_eq!(cfg.trusted_issuers[0].jwks_cache_ttl, DEFAULT_JWKS_CACHE_TTL);
+    assert_eq!(cfg.trusted_issuers[1].subject_claim, "azp");
+    assert_eq!(cfg.trusted_issuers[1].jwks_cache_ttl, Duration::from_secs(60));
+}
+
+#[test]
+fn default_config_trusts_no_external_issuer() {
+    assert!(JwtletConfig::default().trusted_issuers.is_empty());
+}
+
+#[test]
+fn validate_accepts_trusted_issuers() {
+    let cfg = cfg_with_issuers(vec![
+        trusted_issuer("https://idp.example.com/realms/a", "idp-a:"),
+        trusted_issuer("https://idp.example.com/realms/b", "idp-b:"),
+    ]);
+    assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+}
+
+#[test]
+fn validate_fails_when_trusted_issuer_is_invalid() {
+    let cfg = cfg_with_issuers(vec![trusted_issuer("not a url", "idp:")]);
+    assert_error_contains(&cfg, "trusted_issuers[0].issuer is not a valid URL");
+}
+
+#[test]
+fn validate_fails_when_trusted_issuer_is_duplicated() {
+    let cfg = cfg_with_issuers(vec![
+        trusted_issuer("https://idp.example.com", "idp-a:"),
+        trusted_issuer("https://idp.example.com", "idp-b:"),
+    ]);
+    assert_error_contains(
+        &cfg,
+        "trusted_issuers[1].issuer 'https://idp.example.com' is configured more than once",
+    );
+}
+
+#[test]
+fn validate_fails_when_trusted_issuer_is_the_cluster_issuer() {
+    let cfg = cfg_with_issuers(vec![trusted_issuer(
+        "https://kubernetes.default.svc.cluster.local",
+        "idp:",
+    )]);
+    assert_error_contains(&cfg, "must not be the Kubernetes cluster issuer");
+}
+
+#[test]
+fn validate_fails_when_trusted_issuer_is_jwtlet_itself() {
+    let cfg = cfg_with_issuers(vec![trusted_issuer("https://jwtlet.example.com", "idp:")]);
+    assert_error_contains(&cfg, "must not be jwtlet's own issuer");
+}
+
+#[test]
+fn validate_fails_when_jwks_url_is_not_http() {
+    let mut ti = trusted_issuer("https://idp.example.com", "idp:");
+    ti.jwks_url = "file:///etc/jwks.json".to_string();
+    assert_error_contains(
+        &cfg_with_issuers(vec![ti]),
+        "trusted_issuers[0].jwks_url is not a valid http(s) URL",
+    );
+}
+
+#[test]
+fn validate_fails_when_subject_prefix_is_empty() {
+    let cfg = cfg_with_issuers(vec![trusted_issuer("https://idp.example.com", "")]);
+    assert_error_contains(&cfg, "trusted_issuers[0].subject_prefix is required");
+}
+
+#[test]
+fn validate_fails_when_subject_prefix_could_impersonate_kubernetes_identities() {
+    let cfg = cfg_with_issuers(vec![trusted_issuer(
+        "https://idp.example.com",
+        "system:serviceaccount:",
+    )]);
+    assert_error_contains(&cfg, "must not start with 'system:'");
+}
+
+#[test]
+fn validate_fails_when_subject_prefixes_overlap() {
+    let cfg = cfg_with_issuers(vec![
+        trusted_issuer("https://idp.example.com/realms/a", "idp:"),
+        trusted_issuer("https://idp.example.com/realms/b", "idp:b:"),
+    ]);
+    assert_error_contains(
+        &cfg,
+        "trusted_issuers[0].subject_prefix and trusted_issuers[1].subject_prefix overlap",
+    );
+}
+
+#[test]
+fn validate_fails_when_subject_claim_is_empty() {
+    let mut ti = trusted_issuer("https://idp.example.com", "idp:");
+    ti.subject_claim = String::new();
+    assert_error_contains(
+        &cfg_with_issuers(vec![ti]),
+        "trusted_issuers[0].subject_claim cannot be empty",
+    );
+}
+
+#[test]
+fn validate_fails_when_jwks_cache_ttl_is_zero() {
+    let mut ti = trusted_issuer("https://idp.example.com", "idp:");
+    ti.jwks_cache_ttl = Duration::ZERO;
+    assert_error_contains(
+        &cfg_with_issuers(vec![ti]),
+        "trusted_issuers[0].jwks_cache_ttl must be > 0",
+    );
 }

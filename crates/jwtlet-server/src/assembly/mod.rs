@@ -1,4 +1,5 @@
 //  Copyright (c) 2026 Metaform Systems, Inc
+//  Copyright (c) 2026 Airbus SAS
 //
 //  This program and the accompanying materials are made available under the
 //  terms of the Apache License, Version 2.0 which is available at
@@ -8,9 +9,10 @@
 //
 //  Contributors:
 //       Metaform Systems, Inc. - initial API and implementation
+//       Airbus SAS - trusted external issuers
 //
 
-use crate::config::{JwtletConfig, K8sConfig, PostgresPoolConfig, StorageBackend, VaultConfig};
+use crate::config::{JwtletConfig, K8sConfig, PostgresPoolConfig, StorageBackend, TrustedIssuerConfig, VaultConfig};
 use crate::meta::AuthorizationServerMetadata;
 use dsdk_facet_core::context::ParticipantContext;
 use dsdk_facet_core::jwt::{
@@ -19,6 +21,7 @@ use dsdk_facet_core::jwt::{
 };
 use dsdk_facet_core::vault::VaultSigningClient;
 use dsdk_facet_hashicorp_vault::{HashicorpVaultClient, HashicorpVaultConfig, VaultAuthConfig};
+use jwtlet_core::federation::{IssuerRoutingVerifier, TrustedIssuerVerifier, trusted_issuer_map};
 use jwtlet_core::k8s::K8sTokenReviewVerifier;
 use jwtlet_core::resource::mem::MemoryResourceStore;
 use jwtlet_core::resource::{ResourceService, ResourceStore};
@@ -32,7 +35,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 // ============================================================================
 // Constants
 // ============================================================================
@@ -43,6 +46,8 @@ pub const DEFAULT_SIGNING_KEY_PREFIX: &str = "signing";
 
 const K8S_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const K8S_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const JWKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const JWKS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Runtime
@@ -238,7 +243,7 @@ async fn assemble(config: &JwtletConfig, store: Arc<dyn ResourceStore>) -> Resul
             .issuer(issuer.clone())
             .jwtlet_participant_context(config.token.participant_context_claim.clone())
             .token_ttl_secs(config.token.token_ttl_secs)
-            .verifier(Box::new(create_k8s_verifier(&config.k8s).await?))
+            .verifier(create_exchange_verifier(config).await?)
             .resource_service(exchange_resource_service)
             .generator(jwt_generator)
             .build(),
@@ -339,6 +344,49 @@ fn create_jwt_generator(vault_client: Arc<dyn VaultSigningClient>, prefix: &str)
             .key_resolver(Arc::new(PrefixTransitKeyResolver::builder().prefix(prefix).build()))
             .build(),
     )
+}
+
+/// Verifies exchange subject tokens: tokens of a trusted external issuer against that issuer's JWKS,
+/// all other tokens via Kubernetes TokenReview.
+async fn create_exchange_verifier(config: &JwtletConfig) -> Result<Box<dyn JwtVerifier>, JwtletError> {
+    let k8s_verifier = create_k8s_verifier(&config.k8s).await?;
+    if config.trusted_issuers.is_empty() {
+        return Ok(Box::new(k8s_verifier));
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(JWKS_CONNECT_TIMEOUT)
+        .timeout(JWKS_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| JwtletError::Configuration(format!("Failed to build HTTP client: {e}")))?;
+    let verifiers = config
+        .trusted_issuers
+        .iter()
+        .map(|ti| create_trusted_issuer_verifier(ti, client.clone()));
+    for ti in &config.trusted_issuers {
+        info!(issuer = %ti.issuer, subject_prefix = %ti.subject_prefix, "accepting subject tokens of trusted issuer");
+        if ti.jwks_url.starts_with("http://") {
+            warn!(issuer = %ti.issuer, "jwks_url uses plain http; the issuer's keys can be tampered with in transit");
+        }
+    }
+
+    Ok(Box::new(
+        IssuerRoutingVerifier::builder()
+            .default(Box::new(k8s_verifier))
+            .trusted(trusted_issuer_map(verifiers))
+            .build(),
+    ))
+}
+
+fn create_trusted_issuer_verifier(cfg: &TrustedIssuerConfig, client: reqwest::Client) -> TrustedIssuerVerifier {
+    TrustedIssuerVerifier::builder()
+        .issuer(cfg.issuer.clone())
+        .jwks_url(cfg.jwks_url.clone())
+        .subject_prefix(cfg.subject_prefix.clone())
+        .subject_claim(cfg.subject_claim.clone())
+        .jwks_cache_ttl(cfg.jwks_cache_ttl)
+        .client(client)
+        .build()
 }
 
 async fn create_k8s_verifier(cfg: &K8sConfig) -> Result<K8sTokenReviewVerifier, JwtletError> {

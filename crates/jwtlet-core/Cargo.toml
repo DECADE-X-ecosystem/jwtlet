@@ -15,10 +15,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 dsdk-facet-core = { workspace = true }
+jsonwebtoken = { workspace = true }
 notify = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+rstest = { workspace = true }
 wiremock = { workspace = true }
 
 [lints]

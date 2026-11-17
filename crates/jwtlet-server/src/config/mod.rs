@@ -1,4 +1,5 @@
 //  Copyright (c) 2026 Metaform Systems, Inc
+//  Copyright (c) 2026 Airbus SAS
 //
 //  This program and the accompanying materials are made available under the
 //  terms of the Apache License, Version 2.0 which is available at
@@ -8,11 +9,13 @@
 //
 //  Contributors:
 //       Metaform Systems, Inc. - initial API and implementation
+//       Airbus SAS - trusted external issuers
 //
 
 use config::{Config, Environment, File};
+use jwtlet_core::federation::RESERVED_SUBJECT_PREFIX;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -34,6 +37,8 @@ pub const DEFAULT_PARTICIPANT_CONTEXT_CLAIM: &str = "jwtlet_pc";
 pub const DEFAULT_TOKEN_TTL_SECS: i64 = 3600;
 pub const MAX_TOKEN_TTL_SECS: i64 = jwtlet_core::token::MAX_TOKEN_TTL_SECS;
 pub const ENV_CONFIG_FILE: &str = "JWTLET_CONFIG_FILE";
+pub const DEFAULT_SUBJECT_CLAIM: &str = jwtlet_core::federation::DEFAULT_SUBJECT_CLAIM;
+pub const DEFAULT_JWKS_CACHE_TTL: Duration = jwtlet_core::federation::DEFAULT_JWKS_CACHE_TTL;
 
 /// Accepted values for `storage_backend.pool.sslmode`. Mirrors libpq / sqlx semantics.
 pub const VALID_SSL_MODES: &[&str] = &["disable", "prefer", "require", "verify-ca", "verify-full"];
@@ -150,6 +155,27 @@ pub struct ManagementConfig {
     pub client_audience: Option<String>,
 }
 
+/// An external OIDC provider whose tokens are accepted as subject tokens, next to Kubernetes service
+/// account tokens. Its tokens are verified against its JWKS; the client identifier used for resource
+/// mappings is `subject_prefix` followed by the value of `subject_claim`.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TrustedIssuerConfig {
+    /// Expected `iss` claim, e.g. `https://idp.example.com/realms/example`.
+    pub issuer: String,
+    /// URL of the provider's JSON Web Key Set.
+    pub jwks_url: String,
+    /// Namespace for the provider's subjects, e.g. `external-idp:`. Must be unique, must not be a
+    /// prefix of another issuer's prefix and must not start with `system:`.
+    pub subject_prefix: String,
+    /// Claim that identifies the caller. Defaults to `sub`; client-credentials tokens of some
+    /// providers carry the client in `azp` or `client_id`.
+    #[serde(default = "default_subject_claim")]
+    pub subject_claim: String,
+    /// How long the fetched JWKS is cached. Defaults to 5 minutes.
+    #[serde(default = "default_jwks_cache_ttl", with = "humantime_serde")]
+    pub jwks_cache_ttl: Duration,
+}
+
 /// Configuration for issued JWT tokens.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -202,6 +228,10 @@ pub struct JwtletConfig {
     pub service_accounts: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub management: ManagementConfig,
+    /// External OIDC providers whose tokens are accepted on the token exchange endpoint. The
+    /// management API keeps accepting Kubernetes service account tokens only.
+    #[serde(default)]
+    pub trusted_issuers: Vec<TrustedIssuerConfig>,
 }
 
 impl Default for JwtletConfig {
@@ -217,6 +247,7 @@ impl Default for JwtletConfig {
             vault: VaultConfig::default(),
             service_accounts: HashMap::new(),
             management: ManagementConfig::default(),
+            trusted_issuers: Vec::new(),
         }
     }
 }
@@ -295,6 +326,8 @@ impl JwtletConfig {
             ));
         }
 
+        self.validate_trusted_issuers(&mut errors);
+
         // Postgres URL required when using that backend
         if let StorageBackend::Postgres { url, pool } = &self.storage_backend {
             if url.is_empty() {
@@ -355,6 +388,61 @@ impl JwtletConfig {
     }
 }
 
+impl JwtletConfig {
+    fn validate_trusted_issuers(&self, errors: &mut Vec<String>) {
+        let mut issuers = HashSet::new();
+        for (i, ti) in self.trusted_issuers.iter().enumerate() {
+            let at = format!("trusted_issuers[{i}]");
+            if ti.issuer.parse::<reqwest::Url>().is_err() {
+                errors.push(format!("{at}.issuer is not a valid URL: '{}'", ti.issuer));
+            }
+            if !issuers.insert(ti.issuer.as_str()) {
+                errors.push(format!("{at}.issuer '{}' is configured more than once", ti.issuer));
+            }
+            // Tokens of these issuers must keep going through their own verification.
+            if Some(&ti.issuer) == self.k8s.cluster_issuer.as_ref() {
+                errors.push(format!("{at}.issuer must not be the Kubernetes cluster issuer"));
+            }
+            if Some(&ti.issuer) == self.issuer.as_ref() {
+                errors.push(format!("{at}.issuer must not be jwtlet's own issuer"));
+            }
+            match ti.jwks_url.parse::<reqwest::Url>() {
+                Ok(url) if url.scheme() == "https" || url.scheme() == "http" => {}
+                _ => errors.push(format!("{at}.jwks_url is not a valid http(s) URL: '{}'", ti.jwks_url)),
+            }
+            if ti.subject_prefix.is_empty() {
+                errors.push(format!("{at}.subject_prefix is required"));
+            } else if ti.subject_prefix.starts_with(RESERVED_SUBJECT_PREFIX) {
+                errors.push(format!(
+                    "{at}.subject_prefix must not start with '{RESERVED_SUBJECT_PREFIX}' (reserved for Kubernetes identities)"
+                ));
+            }
+            // A prefix that starts another one would let subjects of the two issuers collide:
+            // "a:" + "b:x" == "a:b:" + "x".
+            for (j, other) in self.trusted_issuers.iter().enumerate() {
+                if i < j
+                    && !ti.subject_prefix.is_empty()
+                    && !other.subject_prefix.is_empty()
+                    && (ti.subject_prefix.starts_with(&other.subject_prefix)
+                        || other.subject_prefix.starts_with(&ti.subject_prefix))
+                {
+                    errors.push(format!(
+                        "trusted_issuers[{i}].subject_prefix and trusted_issuers[{j}].subject_prefix overlap \
+                         ('{}', '{}'); subjects of the two issuers could collide",
+                        ti.subject_prefix, other.subject_prefix
+                    ));
+                }
+            }
+            if ti.subject_claim.is_empty() {
+                errors.push(format!("{at}.subject_claim cannot be empty"));
+            }
+            if ti.jwks_cache_ttl.is_zero() {
+                errors.push(format!("{at}.jwks_cache_ttl must be > 0"));
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Default functions
 // ============================================================================
@@ -381,6 +469,14 @@ fn default_participant_context_claim() -> String {
 
 const fn default_token_ttl_secs() -> i64 {
     DEFAULT_TOKEN_TTL_SECS
+}
+
+fn default_subject_claim() -> String {
+    DEFAULT_SUBJECT_CLAIM.to_string()
+}
+
+const fn default_jwks_cache_ttl() -> Duration {
+    DEFAULT_JWKS_CACHE_TTL
 }
 
 // ============================================================================

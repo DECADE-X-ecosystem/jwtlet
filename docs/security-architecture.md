@@ -104,6 +104,23 @@ the TokenReview user must have a `system:serviceaccount:` username and belong to
 users, static or bootstrap tokens) are rejected. The SA's UID, when returned, is recorded
 in the issued token's `act.k8s_uid` claim.
 
+**External subject tokens.** Operators can list external OIDC providers in `trusted_issuers`.
+Jwtlet reads the subject token's `iss` without verification only to choose a verifier: a token
+whose `iss` is a trusted issuer is verified locally against that issuer's JWKS; every other token
+goes through TokenReview. The chosen verifier checks the token in full, so a forged `iss` only
+selects which verifier rejects it. Local verification accepts asymmetric algorithms only
+(RS*, PS*, ES256/384, EdDSA), never a key published for encryption or pinned to another algorithm,
+and requires `iss`, `exp` and an `aud` that contains `token.client_audience`. The JWKS is cached
+(`jwks_cache_ttl`, default 5 minutes); an unknown `kid` triggers a refetch at most every 30 seconds.
+If the JWKS cannot be fetched, verification fails.
+
+The client identifier for such a token is the issuer's `subject_prefix` followed by the subject
+claim (`sub` unless `subject_claim` names another). Prefixes must be unique, must not start with
+another issuer's prefix and must not start with `system:`, so an external subject can never equal
+a Kubernetes service account identity or a subject of another issuer. Subjects that are empty or
+contain whitespace or control characters are rejected. No other claim of the external token is
+copied into the issued token. The management API does not accept external tokens.
+
 **Management API identity.** The management API uses a separate `management.client_audience`
 value. When configured, management callers must present SA tokens bound to that distinct
 audience, providing cryptographic separation between exchange callers and management callers.
@@ -294,7 +311,7 @@ targets regardless of what the caller requests.
 | `nbf`  | Current time                                               |
 | `exp`  | `iat + token_ttl_secs` (default 3600s, maximum 86400s)     |
 | `jti`  | Random UUID, unique per issued token                       |
-| `act`  | `{sub: SA identity, iss: cluster issuer, k8s_uid: SA UID}` from TokenReview |
+| `act`  | `{sub: SA identity, iss: cluster issuer, k8s_uid: SA UID}` from TokenReview, or `{sub: prefixed subject, iss: external issuer}` for a trusted external issuer |
 | *rest* | Merged from scope mapping claim expansion                  |
 
 The `act` claim implements RFC 8693 delegation semantics. It records the K8s SA that
@@ -372,10 +389,12 @@ trail — the application log records who acted; the database log records what c
 The following properties are enforced by the implementation and must hold for the security
 model to be sound:
 
-1. **SA identity is always from TokenReview.** The `act.sub` and the `clientIdentifier`
-   lookup key come exclusively from the TokenReview response. No claim from the incoming
-   token is used directly. The response must confirm the requested audience and identify
-   a Kubernetes service account.
+1. **Caller identity is always verified.** The `act.sub` and the `clientIdentifier`
+   lookup key come exclusively from the TokenReview response or, for a trusted external
+   issuer, from the subject claim of a token verified against that issuer's JWKS, prefixed
+   with the issuer's `subject_prefix`. No other claim from the incoming token is used.
+   A TokenReview response must confirm the requested audience and identify a Kubernetes
+   service account; an external token must carry the requested audience.
 
 2. **Scope expansion cannot override reserved claims.** The reserved claims denylist
    (`sub`, `iss`, `aud`, `exp`, `iat`, `nbf`, `act`, `jti`) is enforced at scope mapping
@@ -412,12 +431,17 @@ services. Failure to adhere to these rules invalidates the model's guarantees.
   own identifier
 - Validate `exp` and reject expired tokens
 - Log `act.sub` to preserve the chain-of-custody record
-- Optionally reject tokens where `act.iss` does not match the expected K8s cluster issuer
+- Optionally reject tokens where `act.iss` is neither the expected K8s cluster issuer nor a
+  trusted external issuer they accept
 
 **Operators must:**
 
 - Treat orchestrator SA credentials as CA-equivalent secrets — rotate on any suspected
   compromise, limit distribution, and audit access
+- Trust an external issuer only when it is administered as carefully as the cluster: whoever
+  can issue a token for a client of that issuer can exchange it under that client's mappings.
+  Serve its `jwks_url` over https and require the provider to put `token.client_audience` in
+  `aud` only for clients meant to call Jwtlet
 - Use dedicated values for `token.client_audience` and `management.client_audience`, never
   the Kubernetes API server audience, and issue projected SA tokens for them
 - Set `token_ttl_secs` to the shortest value consistent with operational requirements;

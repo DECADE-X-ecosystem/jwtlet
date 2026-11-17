@@ -1,4 +1,5 @@
 //  Copyright (c) 2026 Metaform Systems, Inc
+//  Copyright (c) 2026 Airbus SAS
 //
 //  This program and the accompanying materials are made available under the
 //  terms of the Apache License, Version 2.0 which is available at
@@ -8,8 +9,10 @@
 //
 //  Contributors:
 //       Metaform Systems, Inc. - initial API and implementation
+//       Airbus SAS - trusted external issuers
 //
 
+pub mod federation;
 pub mod k8s;
 pub mod resource;
 pub mod saccount;

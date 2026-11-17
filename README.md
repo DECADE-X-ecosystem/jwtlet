@@ -106,7 +106,39 @@ client_audience = "jwtlet-management" # optional – expected aud of management 
 #   jwtlet:management:scope:write     – create/update/delete scope mappings
 [service_accounts]
 "system:serviceaccount:my-namespace:my-sa" = ["jwtlet:management:mappings:write", "jwtlet:management:scope:write"]
+
+# Trusted external issuers (optional, repeatable)
+# Tokens of these OIDC providers are accepted as subject tokens on the token exchange endpoint,
+# next to Kubernetes service account tokens. See "External Subject Tokens" below.
+[[trusted_issuers]]
+issuer = "https://idp.example.com/realms/example"                          # required – expected iss
+jwks_url = "https://idp.example.com/realms/example/protocol/openid-connect/certs" # required
+subject_prefix = "external-idp:"  # required – namespaces the subject; unique, must not start with "system:"
+subject_claim = "azp"             # default "sub"
+jwks_cache_ttl = "5m"             # default
 ```
+
+### External Subject Tokens
+
+Workloads that run outside the cluster have no Kubernetes service account token. When their OIDC
+provider is listed in `trusted_issuers`, they can present a token of that provider as the
+`subject_token` instead:
+
+- Jwtlet picks the verifier by the token's `iss`. Tokens of a trusted issuer are verified locally
+  against the issuer's JWKS (signature with an asymmetric algorithm, `iss`, `aud` must contain
+  `token.client_audience`, `exp`, `nbf`). All other tokens go through TokenReview as before.
+- The client identifier is `subject_prefix` followed by the value of `subject_claim`, e.g.
+  `external-idp:my-client`. Resource mappings are created for that identifier, exactly as for
+  service accounts. The prefix keeps external subjects apart from Kubernetes identities and from
+  subjects of other issuers.
+- The issued token records the caller in `act` (`act.sub` is the prefixed subject, `act.iss` the
+  external issuer).
+
+The management API keeps accepting Kubernetes service account tokens only.
+
+For a client-credentials token of Keycloak, add an audience mapper for `token.client_audience` to
+the client and set `subject_claim = "azp"` (the `sub` of such a token is the UUID of the client's
+service account user).
 
 ### Management API Authentication
 
